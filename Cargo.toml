@@ -1,0 +1,29 @@
+[package]
+name = "dataset_handler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parquet = { version = "55.0.0", features = ["arrow"] }
+arrow = { version = "55.0.0" } # 或 arrow-array, arrow-schema 等
+arrow-array = "55.0.0"
+arrow-schema = "55.0.0"
+serde_json = "1.0"
+rayon = "1.10"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+clap = { version = "4.0", features = ["derive"] }
+
+# 可选依赖，用于SIMD优化
+simd-json = { version = "0.15.1", optional = true }
+
+[features]
+default = []
+simd-json = ["dep:simd-json"]
+
+# 为发布版本优化
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
