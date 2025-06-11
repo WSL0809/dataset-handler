@@ -1,0 +1,104 @@
+name: 多平台构建
+
+on:
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: dataset-handler.exe
+            release_name: dataset-handler-windows-x64.exe
+          - platform: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: dataset-handler
+            release_name: dataset-handler-linux-x64
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: dataset-handler
+            release_name: dataset-handler-macos-arm64
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 安装 Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: 安装依赖 (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+
+    - name: 配置 Rust 缓存
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.platform }}
+
+    - name: 编译项目
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: 运行测试
+      run: |
+        cargo test --target ${{ matrix.target }}
+
+    - name: 准备发布文件
+      shell: bash
+      run: |
+        mkdir -p release
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release/${{ matrix.release_name }}
+        else
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release/${{ matrix.release_name }}
+          chmod +x release/${{ matrix.release_name }}
+        fi
+
+    - name: 上传编译产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.release_name }}
+        path: release/${{ matrix.release_name }}
+        retention-days: 30
+
+  # 可选：创建发布版本（当推送标签时）
+  release:
+    name: 创建发布版本
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: 下载所有编译产物
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: 创建发布版本
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/dataset-handler-windows-x64.exe/dataset-handler-windows-x64.exe
+          artifacts/dataset-handler-linux-x64/dataset-handler-linux-x64
+          artifacts/dataset-handler-macos-arm64/dataset-handler-macos-arm64
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

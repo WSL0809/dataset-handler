@@ -423,12 +423,14 @@ async fn writer_task(
     let mut log_rows_written_since_last_log: u64 = 0;
     let mut total_rows_written: u64 = 0; // 添加记录实际写入的行数
     
-    // 预分配大字符串缓冲区，用于批量写入
-    let mut write_buffer = String::with_capacity(1024 * 1024); // 1MB 初始大小
-    let flush_threshold = 4 * 1024 * 1024; // 当缓冲区超过4MB时刷新
+    // 收集所有 JSON 对象到一个向量中，最后组成 JSON 数组
+    let mut all_json_objects: Vec<String> = Vec::new();
     
     let mut data_rx_active = true;
     let mut progress_rx_active = true;
+
+    // 写入 JSON 数组开始符号
+    file.write_all(b"[").await?;
 
     while data_rx_active || progress_rx_active {
         tokio::select! {
@@ -440,22 +442,12 @@ async fn writer_task(
                         batch_count +=1;
                         let mut rows_in_batch_successfully_written = 0;
                         
-                        // 批量组合JSON字符串，然后一次性写入
-                        write_buffer.clear(); // 确保缓冲区是空的
-                        
+                        // 收集成功的 JSON 字符串
                         for result_item in batch_json_strings_results {
                             match result_item {
                                 Ok(json_string) => {
-                                    write_buffer.push_str(&json_string);
-                                    write_buffer.push('\n');
+                                    all_json_objects.push(json_string);
                                     rows_in_batch_successfully_written += 1;
-                                    
-                                    // 当缓冲区足够大时，执行一次写入并清空缓冲区
-                                    if write_buffer.len() >= flush_threshold {
-                                        file.write_all(write_buffer.as_bytes()).await?;
-                                        // 重要：写入后清空缓冲区，避免重复写入
-                                        write_buffer.clear();
-                                    }
                                 }
                                 Err(e_row) => { // Renamed to e_row to avoid any ambiguity
                                     eprintln!("[Writer] Error converting a row to JSON, skipping row: {:?}", e_row);
@@ -463,20 +455,8 @@ async fn writer_task(
                             }
                         }
                         
-                        // 写入剩余的缓冲区内容
-                        if !write_buffer.is_empty() {
-                            file.write_all(write_buffer.as_bytes()).await?;
-                            // 写入后必须清空，避免后续处理再次写入相同内容
-                            write_buffer.clear();
-                        }
-                        
                         log_rows_written_since_last_log += rows_in_batch_successfully_written;
                         total_rows_written += rows_in_batch_successfully_written;
-                        
-                        // 大型批次处理后执行一次flush减少内存压力
-                        if rows_in_batch_successfully_written > 100000 {
-                            file.flush().await?;
-                        }
                     }
                     Some(Err(e)) => { // Error received from processor task over the channel
                         eprintln!("[Writer] Received an error from processor task: {:?}", e);
@@ -485,11 +465,17 @@ async fn writer_task(
                     }
                     None => { // Data channel (rx) is now closed
                         println!("[Writer] Processor data channel closed. No more data batches expected.");
-                        // 确保所有数据都写入磁盘
-                        if !write_buffer.is_empty() {
-                            file.write_all(write_buffer.as_bytes()).await?;
-                            write_buffer.clear();
+                        
+                        // 写入所有收集的 JSON 对象
+                        for (i, json_obj) in all_json_objects.iter().enumerate() {
+                            if i > 0 {
+                                file.write_all(b",").await?; // 添加逗号分隔符
+                            }
+                            file.write_all(json_obj.as_bytes()).await?;
                         }
+                        
+                        // 写入 JSON 数组结束符号
+                        file.write_all(b"]").await?;
                         file.flush().await?;
                         data_rx_active = false; // Stop polling this branch
                     }
@@ -533,7 +519,7 @@ async fn writer_task(
 // run_conversion (Identical to Tokio + Rayon version, orchestrates tasks)
 async fn run_conversion(
     parquet_input_path: PathBuf,
-    jsonl_output_path: PathBuf,
+    json_output_path: PathBuf,
     batch_size: usize,
     projection: Option<Vec<String>>,
     channel_buffer_size: usize,
@@ -559,7 +545,7 @@ async fn run_conversion(
 
     let reader_handle = tokio::spawn(reader_task(parquet_input_path.clone(), batch_size, projection.clone(), rb_tx));
     let processor_handle = tokio::spawn(processor_task(rb_rx, pb_tx, progress_tx, use_simd_json));
-    let writer_handle = tokio::spawn(writer_task(jsonl_output_path.clone(), pb_rx, progress_rx));
+    let writer_handle = tokio::spawn(writer_task(json_output_path.clone(), pb_rx, progress_rx));
 
     // Await task completion and handle results
     match reader_handle.await? {
@@ -636,7 +622,7 @@ struct Cli {
     parquet_input: PathBuf,
 
     #[clap(short, long, value_parser)]
-    jsonl_output: PathBuf,
+    json_output: PathBuf,
 
     #[clap(short, long, default_value_t = 16384)]
     batch_size: usize,
@@ -659,17 +645,17 @@ async fn main() {
     let cli = Cli::parse(); // 解析命令行参数
 
     let parquet_input_path = cli.parquet_input;
-    let jsonl_output_path = cli.jsonl_output;
+    let json_output_path = cli.json_output;
     let batch_size = cli.batch_size;
     let channel_buffer_size = cli.channel_buffer;
     let projection = cli.projection;
     let num_threads = cli.num_threads;
     let use_simd_json = cli.use_simd_json;
 
-    println!("Starting Asynchronous Parquet to JSONL conversion (Tokio only, parallel batch processing)...");
+    println!("Starting Asynchronous Parquet to JSON conversion (Tokio only, parallel batch processing)...");
     match run_conversion(
         parquet_input_path,
-        jsonl_output_path,
+        json_output_path,
         batch_size,
         projection,
         channel_buffer_size,
@@ -689,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_conversion_successfully() {
         let test_parquet_input = PathBuf::from("test_input_conversion.parquet");
-        let test_jsonl_output = PathBuf::from("test_output_conversion.jsonl");
+        let test_json_output = PathBuf::from("test_output_conversion.json");
         let num_rows = 100;
         let num_cols = 3;
         let batch_size = 5000;
@@ -701,7 +687,7 @@ mod tests {
             Err(e) => {
                 // Clean up before panicking
                 let _ = fs::remove_file(&test_parquet_input);
-                let _ = fs::remove_file(&test_jsonl_output);
+                let _ = fs::remove_file(&test_json_output);
                 panic!("[Test] Failed to create dummy Parquet file: {:?}", e);
             }
         }
@@ -709,7 +695,7 @@ mod tests {
         // 2. Run conversion
         let conversion_result = run_conversion(
             test_parquet_input.clone(),
-            test_jsonl_output.clone(),
+            test_json_output.clone(),
             batch_size,
             None, // No projection for this test
             channel_buffer_size,
@@ -729,39 +715,44 @@ mod tests {
                 println!("[Test] Conversion successful. Processed {} rows.", processed_rows);
 
                 // Optional: Verify output file content (e.g., count lines)
-                if let Ok(output_content) = fs::read_to_string(&test_jsonl_output) {
-                    let lines: Vec<&str> = output_content.lines().collect();
-                    assert_eq!(lines.len(), num_rows, "[Test] JSONL output line count mismatch.");
-                     // Basic check for non-empty lines if rows > 0
-                    if num_rows > 0 {
-                        assert!(!lines[0].is_empty(), "[Test] First line of JSONL output is empty.");
+                if let Ok(output_content) = fs::read_to_string(&test_json_output) {
+                    let parsed_json: JsonValue = serde_json::from_str(&output_content)
+                        .expect("[Test] Failed to parse JSON output.");
+                    if let JsonValue::Array(array) = parsed_json {
+                        assert_eq!(array.len(), num_rows, "[Test] JSON output array length mismatch.");
+                        // Basic check for non-empty array if rows > 0
+                        if num_rows > 0 {
+                            assert!(!array.is_empty(), "[Test] JSON array is empty but expected data.");
+                        }
+                        println!("[Test] JSON output file has {} objects as expected.", array.len());
+                    } else {
+                        panic!("[Test] JSON output is not an array.");
                     }
-                    println!("[Test] JSONL output file has {} lines as expected.", lines.len());
                 } else {
                     // Clean up before failing
                     let _ = fs::remove_file(&test_parquet_input);
-                    let _ = fs::remove_file(&test_jsonl_output);
-                    panic!("[Test] Could not read output JSONL file for verification.");
+                    let _ = fs::remove_file(&test_json_output);
+                    panic!("[Test] Could not read output JSON file for verification.");
                 }
             }
             Err(e) => {
                 // Clean up before panicking
                 let _ = fs::remove_file(&test_parquet_input);
-                let _ = fs::remove_file(&test_jsonl_output);
+                let _ = fs::remove_file(&test_json_output);
                 panic!("[Test] Conversion failed: {:?}", e);
             }
         }
 
         // 4. Clean up files
         let _ = fs::remove_file(&test_parquet_input);
-        let _ = fs::remove_file(&test_jsonl_output);
+        let _ = fs::remove_file(&test_json_output);
         println!("[Test] Cleaned up temporary test files.");
     }
 
     #[tokio::test]
     async fn test_run_conversion_with_projection() {
         let test_parquet_input = PathBuf::from("test_input_projection.parquet");
-        let test_jsonl_output = PathBuf::from("test_output_projection.jsonl");
+        let test_json_output = PathBuf::from("test_output_projection.json");
         let num_rows = 50;
         let num_cols = 5; // col_int_0, col_str_1, col_ts_2, col_int_3, col_str_4
         let batch_size = 20;
@@ -779,7 +770,7 @@ mod tests {
 
         let result = run_conversion(
             test_parquet_input.clone(),
-            test_jsonl_output.clone(),
+            test_json_output.clone(),
             batch_size,
             projection,
             channel_buffer_size,
@@ -790,37 +781,40 @@ mod tests {
         match result {
             Ok(processed_rows) => {
                 assert_eq!(processed_rows, num_rows as u64, "[TestProjection] Row count mismatch.");
-                if let Ok(output_content) = fs::read_to_string(&test_jsonl_output) {
-                    let lines: Vec<&str> = output_content.lines().collect();
-                    assert_eq!(lines.len(), num_rows, "[TestProjection] Output line count mismatch.");
-                    if num_rows > 0 {
-                        let first_line_json: JsonValue = serde_json::from_str(lines[0])
-                            .expect("[TestProjection] Failed to parse first line of JSON output.");
-                        if let JsonValue::Object(map) = first_line_json {
-                            assert_eq!(map.len(), expected_columns.len(), "[TestProjection] Projected column count mismatch.");
-                            for col_name in expected_columns {
-                                assert!(map.contains_key(col_name), "[TestProjection] Expected column '{}' not found.", col_name);
+                if let Ok(output_content) = fs::read_to_string(&test_json_output) {
+                    let parsed_json: JsonValue = serde_json::from_str(&output_content)
+                        .expect("[TestProjection] Failed to parse JSON output.");
+                    if let JsonValue::Array(array) = parsed_json {
+                        assert_eq!(array.len(), num_rows, "[TestProjection] JSON array length mismatch.");
+                        if num_rows > 0 {
+                            if let JsonValue::Object(map) = &array[0] {
+                                assert_eq!(map.len(), expected_columns.len(), "[TestProjection] Projected column count mismatch.");
+                                for col_name in expected_columns {
+                                    assert!(map.contains_key(col_name), "[TestProjection] Expected column '{}' not found.", col_name);
+                                }
+                            } else {
+                                panic!("[TestProjection] First element of JSON array is not an object.");
                             }
-                        } else {
-                            panic!("[TestProjection] First line of output is not a JSON object.");
                         }
+                    } else {
+                        panic!("[TestProjection] JSON output is not an array.");
                     }
                 } else {
-                    panic!("[TestProjection] Could not read output JSONL.");
+                    panic!("[TestProjection] Could not read output JSON.");
                 }
             }
             Err(e) => panic!("[TestProjection] Conversion failed: {:?}", e),
         }
 
         let _ = fs::remove_file(&test_parquet_input);
-        let _ = fs::remove_file(&test_jsonl_output);
+        let _ = fs::remove_file(&test_json_output);
         println!("[TestProjection] Test completed and files cleaned up.");
     }
 
     #[tokio::test]
     async fn test_run_conversion_zero_rows() {
         let test_parquet_input = PathBuf::from("test_input_zero_rows.parquet");
-        let test_jsonl_output = PathBuf::from("test_output_zero_rows.jsonl");
+        let test_json_output = PathBuf::from("test_output_zero_rows.json");
         let num_rows = 0;
         let num_cols = 3;
         let batch_size = 10;
@@ -832,7 +826,7 @@ mod tests {
 
         let result = run_conversion(
             test_parquet_input.clone(),
-            test_jsonl_output.clone(),
+            test_json_output.clone(),
             batch_size,
             None,
             channel_buffer_size,
@@ -843,17 +837,24 @@ mod tests {
         match result {
             Ok(processed_rows) => {
                 assert_eq!(processed_rows, 0, "[TestZeroRows] Processed rows should be 0.");
-                if let Ok(output_content) = fs::read_to_string(&test_jsonl_output) {
-                    assert!(output_content.is_empty(), "[TestZeroRows] Output file should be empty for zero input rows.");
+                if let Ok(output_content) = fs::read_to_string(&test_json_output) {
+                    let parsed_json: JsonValue = serde_json::from_str(&output_content)
+                        .expect("[TestZeroRows] Failed to parse JSON output.");
+                    if let JsonValue::Array(array) = parsed_json {
+                        assert!(array.is_empty(), "[TestZeroRows] JSON array should be empty for zero input rows.");
+                    } else {
+                        panic!("[TestZeroRows] JSON output is not an array.");
+                    }
                 } else {
                     // It's also okay if the file was created but is empty.
                     // If create_dummy_parquet_file with 0 rows doesn't create a file, this branch might not be hit.
                     // The primary check is processed_rows == 0.
-                    // If the file *is* created (e.g., by TokioFile::create), then it should be empty.
-                    // Check if file exists and is empty.
-                    if test_jsonl_output.exists() {
-                         let metadata = fs::metadata(&test_jsonl_output).expect("[TestZeroRows] Failed to get metadata for output file.");
-                         assert_eq!(metadata.len(), 0, "[TestZeroRows] Output file was created but is not empty.");
+                    // If the file *is* created (e.g., by TokioFile::create), then it should contain an empty array.
+                    // Check if file exists and contains empty array.
+                    if test_json_output.exists() {
+                         let metadata = fs::metadata(&test_json_output).expect("[TestZeroRows] Failed to get metadata for output file.");
+                         // For empty array, file should contain "[]"
+                         assert_eq!(metadata.len(), 2, "[TestZeroRows] Output file should contain empty JSON array [].");
                     } else {
                         // If the file isn't created at all for 0 rows, that's also acceptable.
                         println!("[TestZeroRows] Output file was not created, which is acceptable for 0 rows processed if writer doesn't create empty files.");
@@ -864,13 +865,13 @@ mod tests {
         }
 
         let _ = fs::remove_file(&test_parquet_input);
-        let _ = fs::remove_file(&test_jsonl_output);
+        let _ = fs::remove_file(&test_json_output);
         println!("[TestZeroRows] Test completed and files cleaned up.");
     }
 
     async fn run_batch_size_test_case(num_rows: usize, batch_size: usize, test_id: &str) {
         let test_parquet_input = PathBuf::from(format!("test_input_batch_{}.parquet", test_id));
-        let test_jsonl_output = PathBuf::from(format!("test_output_batch_{}.jsonl", test_id));
+        let test_json_output = PathBuf::from(format!("test_output_batch_{}.json", test_id));
         let num_cols = 2;
         let channel_buffer_size = (num_rows / batch_size.max(1)).max(2).min(20); // Dynamic buffer
 
@@ -880,7 +881,7 @@ mod tests {
 
         let result = run_conversion(
             test_parquet_input.clone(),
-            test_jsonl_output.clone(),
+            test_json_output.clone(),
             batch_size,
             None,
             channel_buffer_size,
@@ -892,18 +893,29 @@ mod tests {
             Ok(processed_rows) => {
                 assert_eq!(processed_rows, num_rows as u64, "[TestBatch-{}] Row count mismatch. Expected {}, got {}", test_id, num_rows, processed_rows);
                 if num_rows > 0 {
-                    if let Ok(output_content) = fs::read_to_string(&test_jsonl_output) {
-                        let lines: Vec<&str> = output_content.lines().collect();
-                        assert_eq!(lines.len(), num_rows, "[TestBatch-{}] Output line count mismatch.", test_id);
+                    if let Ok(output_content) = fs::read_to_string(&test_json_output) {
+                        let parsed_json: JsonValue = serde_json::from_str(&output_content)
+                            .expect(&format!("[TestBatch-{}] Failed to parse JSON output.", test_id));
+                        if let JsonValue::Array(array) = parsed_json {
+                            assert_eq!(array.len(), num_rows, "[TestBatch-{}] JSON array length mismatch.", test_id);
+                        } else {
+                            panic!("[TestBatch-{}] JSON output is not an array.", test_id);
+                        }
                     } else {
-                        panic!("[TestBatch-{}] Could not read output JSONL.", test_id);
+                        panic!("[TestBatch-{}] Could not read output JSON.", test_id);
                     }
                 } else { // num_rows == 0
-                     if let Ok(output_content) = fs::read_to_string(&test_jsonl_output) {
-                        assert!(output_content.is_empty(), "[TestBatch-{}] Output file should be empty for zero input rows.", test_id);
-                    } else if test_jsonl_output.exists() {
-                        let metadata = fs::metadata(&test_jsonl_output).expect("[TestBatch] Failed to get metadata");
-                        assert_eq!(metadata.len(), 0, "[TestBatch-{}] Output file for 0 rows not empty.", test_id);
+                     if let Ok(output_content) = fs::read_to_string(&test_json_output) {
+                        let parsed_json: JsonValue = serde_json::from_str(&output_content)
+                            .expect(&format!("[TestBatch-{}] Failed to parse JSON output for 0 rows.", test_id));
+                        if let JsonValue::Array(array) = parsed_json {
+                            assert!(array.is_empty(), "[TestBatch-{}] JSON array should be empty for zero input rows.", test_id);
+                        } else {
+                            panic!("[TestBatch-{}] JSON output is not an array for 0 rows.", test_id);
+                        }
+                    } else if test_json_output.exists() {
+                        let metadata = fs::metadata(&test_json_output).expect("[TestBatch] Failed to get metadata");
+                        assert_eq!(metadata.len(), 2, "[TestBatch-{}] Output file for 0 rows should contain empty array [].", test_id);
                     }
                 }
             }
@@ -911,7 +923,7 @@ mod tests {
         }
 
         let _ = fs::remove_file(&test_parquet_input);
-        let _ = fs::remove_file(&test_jsonl_output);
+        let _ = fs::remove_file(&test_json_output);
         println!("[TestBatch-{}] Test completed and files cleaned up.", test_id);
     }
 

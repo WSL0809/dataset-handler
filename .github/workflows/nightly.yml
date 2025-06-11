@@ -1,0 +1,164 @@
+name: Nightly 构建
+
+on:
+  schedule:
+    # 每天 UTC 时间 2:00 (北京时间 10:00) 运行
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-changes:
+    name: 检查是否有新提交
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.check.outputs.should-build }}
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+
+    - name: 检查最近24小时是否有提交
+      id: check
+      run: |
+        if git log --since="24 hours ago" --oneline | grep -q .; then
+          echo "should-build=true" >> $GITHUB_OUTPUT
+          echo "发现新提交，将进行构建"
+        else
+          echo "should-build=false" >> $GITHUB_OUTPUT
+          echo "24小时内无新提交，跳过构建"
+        fi
+
+  nightly-build:
+    name: Nightly 构建 ${{ matrix.platform }}
+    needs: check-changes
+    if: needs.check-changes.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: dataset-handler.exe
+            release_name: dataset-handler-nightly-windows-x64.exe
+          - platform: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: dataset-handler
+            release_name: dataset-handler-nightly-linux-x64
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: dataset-handler
+            release_name: dataset-handler-nightly-macos-arm64
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 安装 Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: 安装依赖 (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+
+    - name: 配置 Rust 缓存
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: nightly-${{ matrix.platform }}
+
+    - name: 编译项目
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: 准备发布文件
+      shell: bash
+      run: |
+        mkdir -p nightly
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} nightly/${{ matrix.release_name }}
+        else
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} nightly/${{ matrix.release_name }}
+          chmod +x nightly/${{ matrix.release_name }}
+        fi
+
+    - name: 上传 Nightly 编译产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.release_name }}
+        path: nightly/${{ matrix.release_name }}
+        retention-days: 7
+
+  create-nightly-release:
+    name: 创建 Nightly 发布
+    needs: [check-changes, nightly-build]
+    if: needs.check-changes.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 下载所有编译产物
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: 获取提交信息
+      id: commit
+      run: |
+        echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "commit_date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+    - name: 删除现有的 nightly 标签和发布
+      continue-on-error: true
+      run: |
+        gh release delete nightly --yes || true
+        git push --delete origin nightly || true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 创建新的 nightly 标签
+      run: |
+        git tag nightly
+        git push origin nightly
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 创建 Nightly 发布
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: nightly
+        name: "Nightly Build (${{ steps.commit.outputs.commit_date }} - ${{ steps.commit.outputs.short_sha }})"
+        body: |
+          **🌙 Nightly Build**
+          
+          这是基于最新 main 分支代码的自动构建版本。
+          
+          - 构建日期: ${{ steps.commit.outputs.commit_date }}
+          - 提交哈希: ${{ steps.commit.outputs.short_sha }}
+          - 构建时间: ${{ github.run_id }}
+          
+          > ⚠️ 这是开发版本，可能包含未经充分测试的功能，仅供测试使用。
+          
+          ### 下载说明
+          - `dataset-handler-nightly-windows-x64.exe` - Windows 64位版本
+          - `dataset-handler-nightly-linux-x64` - Linux 64位版本  
+          - `dataset-handler-nightly-macos-arm64` - macOS ARM64 (M1/M2) 版本
+        files: |
+          artifacts/dataset-handler-nightly-windows-x64.exe/dataset-handler-nightly-windows-x64.exe
+          artifacts/dataset-handler-nightly-linux-x64/dataset-handler-nightly-linux-x64
+          artifacts/dataset-handler-nightly-macos-arm64/dataset-handler-nightly-macos-arm64
+        draft: false
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
