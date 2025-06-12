@@ -1,0 +1,11 @@
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-L", "/root/.xwin/crt/lib/x86_64",
+    "-L", "/root/.xwin/sdk/lib/um/x86_64",
+    "-L", "/root/.xwin/sdk/lib/ucrt/x86_64"
+]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc" 
